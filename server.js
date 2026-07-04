@@ -217,7 +217,7 @@ wss.on('connection', (twilioWs) => {
         const pcm16k = resamplePCM16(pcm8k, 8000, 16000);
         const payload = JSON.stringify({
           realtimeInput: {
-            mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: pcm16k.toString('base64') }],
+            audio: { mimeType: 'audio/pcm;rate=16000', data: pcm16k.toString('base64') },
           },
         });
         if (geminiReady && geminiWs.readyState === WebSocket.OPEN) {
