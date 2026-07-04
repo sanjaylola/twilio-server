@@ -8,7 +8,7 @@ const port = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 const DESTINATION_NUMBER = '+16472027681';
-const GEMINI_MODEL = 'models/gemini-2.0-flash-live-001';
+const GEMINI_MODEL = 'models/gemini-2.0-flash-exp';
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
