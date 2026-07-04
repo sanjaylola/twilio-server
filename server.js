@@ -168,6 +168,14 @@ wss.on('connection', (twilioWs) => {
       while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
         geminiWs.send(pendingAudio.shift());
       }
+      // Prompt an immediate greeting so the caller doesn't hear dead air
+      // while waiting for Gemini's handshake to finish.
+      geminiWs.send(JSON.stringify({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: '(The call has just connected. Greet the caller briefly now.)' }] }],
+          turnComplete: true,
+        },
+      }));
       return;
     }
 
