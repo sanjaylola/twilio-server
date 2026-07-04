@@ -141,9 +141,13 @@ function resamplePCM16(buf, fromRate, toRate) {
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
 
 wss.on('connection', (twilioWs) => {
-  console.log('Twilio media stream connected');
+  const callStart = Date.now();
+  const elapsed = () => `${Date.now() - callStart}ms`;
+  console.log(`[${elapsed()}] Twilio media stream connected`);
   let streamSid = null;
   let geminiReady = false;
+  let firstAudioSentAt = null;
+  let firstAudioReceivedAt = null;
   const pendingAudio = [];
 
   const geminiWs = new WebSocket(
@@ -151,6 +155,7 @@ wss.on('connection', (twilioWs) => {
   );
 
   geminiWs.on('open', () => {
+    console.log(`[${elapsed()}] Gemini WS open`);
     geminiWs.send(JSON.stringify({
       setup: {
         model: GEMINI_MODEL,
@@ -165,18 +170,26 @@ wss.on('connection', (twilioWs) => {
 
     if (msg.setupComplete) {
       geminiReady = true;
+      console.log(`[${elapsed()}] Gemini setup complete`);
       while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
         geminiWs.send(pendingAudio.shift());
       }
       // Prompt an immediate greeting so the caller doesn't hear dead air
       // while waiting for Gemini's handshake to finish.
+      firstAudioSentAt = Date.now();
       geminiWs.send(JSON.stringify({
         clientContent: {
           turns: [{ role: 'user', parts: [{ text: '(The call has just connected. Greet the caller briefly now.)' }] }],
           turnComplete: true,
         },
       }));
+      console.log(`[${elapsed()}] Greeting prompt sent to Gemini`);
       return;
+    }
+
+    if (!firstAudioReceivedAt && msg.serverContent?.modelTurn?.parts?.some(p => p.inlineData)) {
+      firstAudioReceivedAt = Date.now();
+      console.log(`[${elapsed()}] First audio chunk received from Gemini (${firstAudioReceivedAt - firstAudioSentAt}ms after greeting prompt)`);
     }
 
     const parts = msg.serverContent?.modelTurn?.parts;
