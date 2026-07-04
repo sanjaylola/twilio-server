@@ -141,8 +141,17 @@ wss.on('connection', (twilioWs) => {
     }
   });
 
+  geminiWs.on('unexpected-response', (req, response) => {
+    let body = '';
+    response.on('data', (chunk) => { body += chunk; });
+    response.on('end', () => {
+      console.error('Gemini WS rejected handshake:', response.statusCode, body);
+    });
+  });
   geminiWs.on('error', (err) => console.error('Gemini WS error:', err.message));
-  geminiWs.on('close', () => console.log('Gemini WS closed'));
+  geminiWs.on('close', (code, reason) => {
+    console.log('Gemini WS closed:', code, reason?.toString());
+  });
 
   twilioWs.on('message', (message) => {
     const data = JSON.parse(message.toString());
