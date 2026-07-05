@@ -75,12 +75,20 @@ app.get('/', (req, res) => {
 
 app.post('/make-call', async (req, res) => {
   try {
-    const { to, studentName } = req.body || {};
+    const body = req.body || {};
+    console.log('make-call request body:', JSON.stringify(body));
+    // Accept the name under any of the field names client apps have used.
+    const to = body.to || body.toPhone || body.phone || body.number;
+    const studentName = body.studentName || body.student_name || body.name || body.student || '';
     if (!to) {
       return res.status(400).json({ success: false, error: '"to" (E.164 phone number) is required' });
     }
     const host = req.get('host');
-    const streamUrl = `wss://${host}/media-stream${studentName ? `?studentName=${encodeURIComponent(studentName)}` : ''}`;
+    const params = new URLSearchParams();
+    if (studentName) params.set('studentName', studentName);
+    const qs = params.toString();
+    const streamUrl = `wss://${host}/media-stream${qs ? `?${qs}` : ''}`;
+    console.log(`Placing call to ${to}${studentName ? ` for student "${studentName}"` : ' (NO student name provided!)'}`);
     const call = await client.calls.create({
       to,
       from: process.env.TWILIO_PHONE_NUMBER,
