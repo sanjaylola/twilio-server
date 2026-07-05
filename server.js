@@ -7,7 +7,7 @@ const app = express();
 const port = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-const DESTINATION_NUMBER = '+16472027681';
+app.use(express.json());
 const GEMINI_MODEL = 'models/gemini-3.1-flash-live-preview';
 
 const SYSTEM_INSTRUCTION = `
@@ -66,11 +66,16 @@ app.get('/', (req, res) => {
 
 app.post('/make-call', async (req, res) => {
   try {
+    const { to, studentName } = req.body || {};
+    if (!to) {
+      return res.status(400).json({ success: false, error: '"to" (E.164 phone number) is required' });
+    }
     const host = req.get('host');
+    const streamUrl = `wss://${host}/media-stream${studentName ? `?studentName=${encodeURIComponent(studentName)}` : ''}`;
     const call = await client.calls.create({
-      to: DESTINATION_NUMBER,
+      to,
       from: process.env.TWILIO_PHONE_NUMBER,
-      twiml: `<Response><Connect><Stream url="wss://${host}/media-stream" /></Connect></Response>`,
+      twiml: `<Response><Connect><Stream url="${streamUrl}" /></Connect></Response>`,
     });
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
@@ -140,10 +145,11 @@ function resamplePCM16(buf, fromRate, toRate) {
 // Bridges Twilio's Media Stream (8kHz mu-law) to the Gemini Live API (16kHz/24kHz PCM)
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
 
-wss.on('connection', (twilioWs) => {
+wss.on('connection', (twilioWs, req) => {
   const callStart = Date.now();
   const elapsed = () => `${Date.now() - callStart}ms`;
-  console.log(`[${elapsed()}] Twilio media stream connected`);
+  const studentName = new URL(req.url, 'http://localhost').searchParams.get('studentName');
+  console.log(`[${elapsed()}] Twilio media stream connected${studentName ? ` (student: ${studentName})` : ''}`);
   let streamSid = null;
   let geminiReady = false;
   let firstAudioSentAt = null;
@@ -179,7 +185,7 @@ wss.on('connection', (twilioWs) => {
       firstAudioSentAt = Date.now();
       geminiWs.send(JSON.stringify({
         clientContent: {
-          turns: [{ role: 'user', parts: [{ text: '(The call has just connected. Greet the caller briefly now.)' }] }],
+          turns: [{ role: 'user', parts: [{ text: `(The call has just connected${studentName ? ` with ${studentName}, a student who has gone inactive` : ''}. Greet the caller briefly now${studentName ? ` by name` : ''}.)` }] }],
           turnComplete: true,
         },
       }));
