@@ -8,7 +8,11 @@ const port = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: false })); // Twilio webhooks post form-encoded
+
 const GEMINI_MODEL = 'models/gemini-3.1-flash-live-preview';
+// Sanjay's phone — inbound callers pressing 0 get forwarded here.
+const FORWARD_NUMBER = '+16472027681';
 
 const SYSTEM_INSTRUCTION = `
 You are the voice agent for "My Driving School".
@@ -67,6 +71,16 @@ LATENCY & PHONE CALL SYSTEM INSTRUCTIONS:
 - Keep your answers highly crisp and fast to start speaking.
 `;
 
+const SALES_INSTRUCTION = SYSTEM_INSTRUCTION + `
+
+INBOUND SALES CALL (this session): a potential customer has called the school and chosen their language from the phone menu.
+- You are the school's friendly SALES agent. Your goal is to warmly sell the school's programs, leading with the BDE Course value proposition when lessons come up.
+- Early in the call, politely ask for the caller's name. Once you know it, address them by name naturally, and keep using their name — repeat it every two or three sentences.
+- Near the start of the call, tell the caller: "You can press zero any time to talk to the driving instructor, Sanjay." If the call goes on, remind them once more later where it feels natural.
+- Stay in the caller's chosen language for the entire call unless they switch languages themselves.
+- Never say "How may I help you?" as a standalone cold opener — greet warmly as a salesperson welcoming a potential new student.
+`;
+
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 app.get('/', (req, res) => {
@@ -92,13 +106,34 @@ app.post('/make-call', async (req, res) => {
     const call = await client.calls.create({
       to,
       from: process.env.TWILIO_PHONE_NUMBER,
-      twiml: `<Response><Connect><Stream url="wss://${host}/media-stream">${paramXml}</Stream></Connect></Response>`,
+      twiml: `<Response><Connect><Stream url="wss://${host}/media-stream"><Parameter name="role" value="outbound" />${paramXml}</Stream></Connect></Response>`,
     });
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Inbound calls to the Twilio number: language menu first.
+// Point the Twilio phone number's Voice webhook at POST /incoming-call.
+app.post('/incoming-call', (req, res) => {
+  console.log('Incoming call from', req.body?.From);
+  res.type('text/xml').send(`<Response>
+  <Gather numDigits="1" action="/language-selected" method="POST" timeout="6">
+    <Say>Welcome to My Driving School. For Hindi, press 1. For Punjabi, press 2. For English, press 3, or stay on the line.</Say>
+  </Gather>
+  <Redirect method="POST">/language-selected</Redirect>
+</Response>`);
+});
+
+// After the caller picks a language, bridge them to the AI sales agent.
+app.post('/language-selected', (req, res) => {
+  const digit = (req.body?.Digits || '').trim();
+  const language = digit === '1' ? 'Hindi' : digit === '2' ? 'Punjabi' : 'English';
+  const host = req.get('host');
+  console.log(`Inbound caller chose language: ${language} (digit: "${digit}")`);
+  res.type('text/xml').send(`<Response><Connect><Stream url="wss://${host}/media-stream"><Parameter name="role" value="sales" /><Parameter name="language" value="${language}" /></Stream></Connect></Response>`);
 });
 
 // G.711 mu-law <-> PCM16 conversion (Twilio uses 8kHz mu-law)
@@ -162,114 +197,142 @@ function resamplePCM16(buf, fromRate, toRate) {
 // Bridges Twilio's Media Stream (8kHz mu-law) to the Gemini Live API (16kHz/24kHz PCM)
 const wss = new WebSocket.Server({ server, path: '/media-stream' });
 
-wss.on('connection', (twilioWs, req) => {
+wss.on('connection', (twilioWs) => {
   const callStart = Date.now();
   const elapsed = () => `${Date.now() - callStart}ms`;
   console.log(`[${elapsed()}] Twilio media stream connected`);
-  // Twilio strips query strings from Stream URLs, so the name arrives via
-  // <Parameter> in the start event's customParameters instead.
+  // Twilio strips query strings from Stream URLs, so call context arrives via
+  // <Parameter> elements in the start event's customParameters instead.
+  let geminiWs = null;
   let studentName = null;
+  let role = 'outbound';
+  let language = null;
+  let callSid = null;
   let streamSid = null;
   let geminiReady = false;
-  let streamStarted = false;
   let greetingSent = false;
+  let forwarding = false;
   let firstAudioSentAt = null;
   let firstAudioReceivedAt = null;
   const pendingAudio = [];
 
-  // Prompt an immediate greeting so the caller doesn't hear dead air, but
-  // only once BOTH Gemini is ready AND Twilio's start event has delivered
-  // the student's name — otherwise the agent greets like an inbound call.
-  const maybeSendGreeting = () => {
-    if (greetingSent || !geminiReady || !streamStarted || geminiWs.readyState !== WebSocket.OPEN) return;
-    greetingSent = true;
-    firstAudioSentAt = Date.now();
-    geminiWs.send(JSON.stringify({
-      clientContent: {
-        turns: [{ role: 'user', parts: [{ text: studentName
-          ? `(This is an OUTBOUND call the school placed to ${studentName}, a student who has stopped attending lessons. Do NOT say "How may I help you?". Greet ${studentName} by name now, mention you noticed they haven't been coming to lessons, and warmly ask them to come back, offering help if there's any problem.)`
-          : '(This is an OUTBOUND call the school placed to one of its students. Do NOT say "How may I help you?". Greet them now, mention you noticed they haven\'t been coming to lessons, and warmly ask them to come back, offering help if there\'s any problem.)' }] }],
-        turnComplete: true,
-      },
-    }));
-    console.log(`[${elapsed()}] Greeting prompt sent to Gemini${studentName ? ` (student: ${studentName})` : ' (no student name)'}`);
+  const greetingText = () => {
+    if (role === 'sales') {
+      return `(A potential customer just called My Driving School and chose ${language || 'English'} from the phone menu. Speak ${language || 'English'}. Greet them warmly as the school's sales agent, ask for their name, and mention they can press zero any time to talk to the driving instructor, Sanjay. Do NOT open with a bare "How may I help you?".)`;
+    }
+    return studentName
+      ? `(This is an OUTBOUND call the school placed to ${studentName}, a student who has stopped attending lessons. Do NOT say "How may I help you?". Greet ${studentName} by name now, mention you noticed they haven't been coming to lessons, and warmly ask them to come back, offering help if there's any problem.)`
+      : '(This is an OUTBOUND call the school placed to one of its students. Do NOT say "How may I help you?". Greet them now, mention you noticed they haven\'t been coming to lessons, and warmly ask them to come back, offering help if there\'s any problem.)';
   };
 
-  const geminiWs = new WebSocket(
-    `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${process.env.GOOGLE_API_KEY}`
-  );
+  // Gemini is connected only after Twilio's start event, so the session's
+  // system instruction can match the call's role (outbound coach vs inbound sales).
+  const connectGemini = () => {
+    geminiWs = new WebSocket(
+      `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${process.env.GOOGLE_API_KEY}`
+    );
 
-  geminiWs.on('open', () => {
-    console.log(`[${elapsed()}] Gemini WS open`);
-    geminiWs.send(JSON.stringify({
-      setup: {
-        model: GEMINI_MODEL,
-        generationConfig: { responseModalities: ['AUDIO'] },
-        systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-      },
-    }));
-  });
+    geminiWs.on('open', () => {
+      console.log(`[${elapsed()}] Gemini WS open (role: ${role})`);
+      geminiWs.send(JSON.stringify({
+        setup: {
+          model: GEMINI_MODEL,
+          generationConfig: { responseModalities: ['AUDIO'] },
+          systemInstruction: { parts: [{ text: role === 'sales' ? SALES_INSTRUCTION : SYSTEM_INSTRUCTION }] },
+        },
+      }));
+    });
 
-  geminiWs.on('message', (data) => {
-    const msg = JSON.parse(data.toString());
+    geminiWs.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
 
-    if (msg.setupComplete) {
-      geminiReady = true;
-      console.log(`[${elapsed()}] Gemini setup complete`);
-      while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
-        geminiWs.send(pendingAudio.shift());
+      if (msg.setupComplete) {
+        geminiReady = true;
+        console.log(`[${elapsed()}] Gemini setup complete`);
+        while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
+          geminiWs.send(pendingAudio.shift());
+        }
+        if (!greetingSent) {
+          greetingSent = true;
+          firstAudioSentAt = Date.now();
+          geminiWs.send(JSON.stringify({
+            clientContent: {
+              turns: [{ role: 'user', parts: [{ text: greetingText() }] }],
+              turnComplete: true,
+            },
+          }));
+          console.log(`[${elapsed()}] Greeting prompt sent to Gemini (role: ${role}${studentName ? `, student: ${studentName}` : ''}${language ? `, language: ${language}` : ''})`);
+        }
+        return;
       }
-      maybeSendGreeting();
-      return;
-    }
 
-    if (!firstAudioReceivedAt && msg.serverContent?.modelTurn?.parts?.some(p => p.inlineData)) {
-      firstAudioReceivedAt = Date.now();
-      console.log(`[${elapsed()}] First audio chunk received from Gemini (${firstAudioReceivedAt - firstAudioSentAt}ms after greeting prompt)`);
-    }
+      if (!firstAudioReceivedAt && msg.serverContent?.modelTurn?.parts?.some(p => p.inlineData)) {
+        firstAudioReceivedAt = Date.now();
+        console.log(`[${elapsed()}] First audio chunk received from Gemini (${firstAudioReceivedAt - firstAudioSentAt}ms after greeting prompt)`);
+      }
 
-    const parts = msg.serverContent?.modelTurn?.parts;
-    if (parts) {
-      for (const part of parts) {
-        if (part.inlineData?.data) {
-          const pcm24k = Buffer.from(part.inlineData.data, 'base64');
-          const pcm8k = resamplePCM16(pcm24k, 24000, 8000);
-          const mulaw = pcm16BufferToMuLaw(pcm8k);
-          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload: mulaw.toString('base64') },
-            }));
+      const parts = msg.serverContent?.modelTurn?.parts;
+      if (parts) {
+        for (const part of parts) {
+          if (part.inlineData?.data) {
+            const pcm24k = Buffer.from(part.inlineData.data, 'base64');
+            const pcm8k = resamplePCM16(pcm24k, 24000, 8000);
+            const mulaw = pcm16BufferToMuLaw(pcm8k);
+            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+              twilioWs.send(JSON.stringify({
+                event: 'media',
+                streamSid,
+                media: { payload: mulaw.toString('base64') },
+              }));
+            }
           }
         }
       }
-    }
-  });
-
-  geminiWs.on('unexpected-response', (req, response) => {
-    let body = '';
-    response.on('data', (chunk) => { body += chunk; });
-    response.on('end', () => {
-      console.error('Gemini WS rejected handshake:', response.statusCode, body);
     });
-  });
-  geminiWs.on('error', (err) => console.error('Gemini WS error:', err.message));
-  geminiWs.on('close', (code, reason) => {
-    console.log('Gemini WS closed:', code, reason?.toString());
-  });
+
+    geminiWs.on('unexpected-response', (req2, response) => {
+      let body = '';
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => {
+        console.error('Gemini WS rejected handshake:', response.statusCode, body);
+      });
+    });
+    geminiWs.on('error', (err) => console.error('Gemini WS error:', err.message));
+    geminiWs.on('close', (code, reason) => {
+      console.log('Gemini WS closed:', code, reason?.toString());
+    });
+  };
+
+  // Caller pressed 0: hand the live call off to Sanjay's phone.
+  const forwardToSanjay = async () => {
+    if (forwarding || !callSid) return;
+    forwarding = true;
+    console.log(`[${elapsed()}] Caller pressed 0 — forwarding call ${callSid} to ${FORWARD_NUMBER}`);
+    try {
+      await client.calls(callSid).update({
+        twiml: `<Response><Say>Connecting you to Sanjay now.</Say><Dial>${FORWARD_NUMBER}</Dial></Response>`,
+      });
+    } catch (err) {
+      forwarding = false;
+      console.error('Failed to forward call:', err.message);
+    }
+  };
 
   twilioWs.on('message', (message) => {
     const data = JSON.parse(message.toString());
 
     switch (data.event) {
-      case 'start':
+      case 'start': {
         streamSid = data.start.streamSid;
-        studentName = data.start.customParameters?.studentName || null;
-        streamStarted = true;
-        console.log(`Stream started: ${streamSid}${studentName ? ` (student: ${studentName})` : ' (no student name in customParameters)'}`);
-        maybeSendGreeting();
+        callSid = data.start.callSid;
+        const params = data.start.customParameters || {};
+        studentName = params.studentName || null;
+        role = params.role || 'outbound';
+        language = params.language || null;
+        console.log(`Stream started: ${streamSid} (role: ${role}${studentName ? `, student: ${studentName}` : ''}${language ? `, language: ${language}` : ''})`);
+        connectGemini();
         break;
+      }
 
       case 'media': {
         const mulaw = Buffer.from(data.media.payload, 'base64');
@@ -280,7 +343,7 @@ wss.on('connection', (twilioWs, req) => {
             audio: { mimeType: 'audio/pcm;rate=16000', data: pcm16k.toString('base64') },
           },
         });
-        if (geminiReady && geminiWs.readyState === WebSocket.OPEN) {
+        if (geminiReady && geminiWs && geminiWs.readyState === WebSocket.OPEN) {
           geminiWs.send(payload);
         } else {
           pendingAudio.push(payload);
@@ -288,16 +351,23 @@ wss.on('connection', (twilioWs, req) => {
         break;
       }
 
+      case 'dtmf': {
+        const digit = data.dtmf?.digit;
+        console.log(`[${elapsed()}] DTMF received: ${digit}`);
+        if (digit === '0') forwardToSanjay();
+        break;
+      }
+
       case 'stop':
         console.log('Stream stopped');
-        if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         break;
     }
   });
 
   twilioWs.on('close', () => {
     console.log('Twilio media stream disconnected');
-    if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+    if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
   });
 });
 
