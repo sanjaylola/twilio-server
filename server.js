@@ -272,6 +272,11 @@ wss.on('connection', (twilioWs) => {
       }
 
       const parts = msg.serverContent?.modelTurn?.parts;
+      if (!parts || !parts.some(p => p.inlineData?.data)) {
+        // Not an audio chunk — log it so silent failures are visible.
+        const summary = JSON.stringify(msg);
+        console.log(`[${elapsed()}] Gemini non-audio message: ${summary.length > 600 ? summary.slice(0, 600) + '…' : summary}`);
+      }
       if (parts) {
         for (const part of parts) {
           if (part.inlineData?.data) {
