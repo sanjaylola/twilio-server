@@ -73,11 +73,12 @@ LATENCY & PHONE CALL SYSTEM INSTRUCTIONS:
 
 const SALES_INSTRUCTION = SYSTEM_INSTRUCTION + `
 
-INBOUND SALES CALL (this session): a potential customer has called the school and chosen their language from the phone menu.
+INBOUND SALES CALL (this session): a potential customer has called the school.
 - You are the school's friendly SALES agent. Your goal is to warmly sell the school's programs, leading with the BDE Course value proposition when lessons come up.
+- Your opening must include: a time-appropriate greeting (good morning / good afternoon / good evening as instructed), that you can speak English, Punjabi, and Hindi and the caller can talk to you in any of these languages, and that they can press zero any time to talk to the driving instructor, Sanjay.
 - Early in the call, politely ask for the caller's name. Once you know it, address them by name naturally, and keep using their name — repeat it every two or three sentences.
-- Near the start of the call, tell the caller: "You can press zero any time to talk to the driving instructor, Sanjay." If the call goes on, remind them once more later where it feels natural.
-- Stay in the caller's chosen language for the entire call unless they switch languages themselves.
+- Automatically match whichever language the caller speaks, and switch languages instantly whenever they do.
+- If the call goes on, remind them once more later, where it feels natural, that pressing zero connects them to Sanjay.
 - Never say "How may I help you?" as a standalone cold opener — greet warmly as a salesperson welcoming a potential new student.
 `;
 
@@ -115,25 +116,13 @@ app.post('/make-call', async (req, res) => {
   }
 });
 
-// Inbound calls to the Twilio number: language menu first.
+// Inbound calls to the Twilio number connect straight to the AI sales agent —
+// no language menu; the agent matches whatever language the caller speaks.
 // Point the Twilio phone number's Voice webhook at POST /incoming-call.
 app.post('/incoming-call', (req, res) => {
   console.log('Incoming call from', req.body?.From);
-  res.type('text/xml').send(`<Response>
-  <Gather numDigits="1" action="/language-selected" method="POST" timeout="6">
-    <Say>Welcome to My Driving School. For Hindi, press 1. For Punjabi, press 2. For English, press 3, or stay on the line.</Say>
-  </Gather>
-  <Redirect method="POST">/language-selected</Redirect>
-</Response>`);
-});
-
-// After the caller picks a language, bridge them to the AI sales agent.
-app.post('/language-selected', (req, res) => {
-  const digit = (req.body?.Digits || '').trim();
-  const language = digit === '1' ? 'Hindi' : digit === '2' ? 'Punjabi' : 'English';
   const host = req.get('host');
-  console.log(`Inbound caller chose language: ${language} (digit: "${digit}")`);
-  res.type('text/xml').send(`<Response><Connect><Stream url="wss://${host}/media-stream"><Parameter name="role" value="sales" /><Parameter name="language" value="${language}" /></Stream></Connect></Response>`);
+  res.type('text/xml').send(`<Response><Connect><Stream url="wss://${host}/media-stream"><Parameter name="role" value="sales" /></Stream></Connect></Response>`);
 });
 
 // G.711 mu-law <-> PCM16 conversion (Twilio uses 8kHz mu-law)
@@ -216,9 +205,14 @@ wss.on('connection', (twilioWs) => {
   let firstAudioReceivedAt = null;
   const pendingAudio = [];
 
+  const torontoGreeting = () => {
+    const hour = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Toronto', hour: 'numeric', hour12: false }).format(new Date()));
+    return hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  };
+
   const greetingText = () => {
     if (role === 'sales') {
-      return `(A potential customer just called My Driving School and chose ${language || 'English'} from the phone menu. Speak ${language || 'English'}. Greet them warmly as the school's sales agent, ask for their name, and mention they can press zero any time to talk to the driving instructor, Sanjay. Do NOT open with a bare "How may I help you?".)`;
+      return `(A potential customer just called My Driving School. It is currently ${torontoGreeting().toLowerCase()} in Toronto. Open with "${torontoGreeting()}", welcome them warmly as the school's sales agent, tell them you can speak English, Punjabi, and Hindi and they can talk to you in any of these languages, tell them they can press zero any time to talk to the driving instructor Sanjay, then ask for their name. From then on, match whatever language they speak. Do NOT open with a bare "How may I help you?".)`;
     }
     return studentName
       ? `(This is an OUTBOUND call the school placed to ${studentName}, a student who has stopped attending lessons. Do NOT say "How may I help you?". Greet ${studentName} by name now, mention you noticed they haven't been coming to lessons, and warmly ask them to come back, offering help if there's any problem.)`
