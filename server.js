@@ -84,15 +84,15 @@ app.post('/make-call', async (req, res) => {
       return res.status(400).json({ success: false, error: '"to" (E.164 phone number) is required' });
     }
     const host = req.get('host');
-    const params = new URLSearchParams();
-    if (studentName) params.set('studentName', studentName);
-    const qs = params.toString();
-    const streamUrl = `wss://${host}/media-stream${qs ? `?${qs}` : ''}`;
     console.log(`Placing call to ${to}${studentName ? ` for student "${studentName}"` : ' (NO student name provided!)'}`);
+    // Twilio drops query strings from Stream URLs; custom data must be passed
+    // as <Parameter> elements, delivered in the start event's customParameters.
+    const escapeXml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    const paramXml = studentName ? `<Parameter name="studentName" value="${escapeXml(studentName)}" />` : '';
     const call = await client.calls.create({
       to,
       from: process.env.TWILIO_PHONE_NUMBER,
-      twiml: `<Response><Connect><Stream url="${streamUrl}" /></Connect></Response>`,
+      twiml: `<Response><Connect><Stream url="wss://${host}/media-stream">${paramXml}</Stream></Connect></Response>`,
     });
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
@@ -165,13 +165,35 @@ const wss = new WebSocket.Server({ server, path: '/media-stream' });
 wss.on('connection', (twilioWs, req) => {
   const callStart = Date.now();
   const elapsed = () => `${Date.now() - callStart}ms`;
-  const studentName = new URL(req.url, 'http://localhost').searchParams.get('studentName');
-  console.log(`[${elapsed()}] Twilio media stream connected${studentName ? ` (student: ${studentName})` : ''}`);
+  console.log(`[${elapsed()}] Twilio media stream connected`);
+  // Twilio strips query strings from Stream URLs, so the name arrives via
+  // <Parameter> in the start event's customParameters instead.
+  let studentName = null;
   let streamSid = null;
   let geminiReady = false;
+  let streamStarted = false;
+  let greetingSent = false;
   let firstAudioSentAt = null;
   let firstAudioReceivedAt = null;
   const pendingAudio = [];
+
+  // Prompt an immediate greeting so the caller doesn't hear dead air, but
+  // only once BOTH Gemini is ready AND Twilio's start event has delivered
+  // the student's name — otherwise the agent greets like an inbound call.
+  const maybeSendGreeting = () => {
+    if (greetingSent || !geminiReady || !streamStarted || geminiWs.readyState !== WebSocket.OPEN) return;
+    greetingSent = true;
+    firstAudioSentAt = Date.now();
+    geminiWs.send(JSON.stringify({
+      clientContent: {
+        turns: [{ role: 'user', parts: [{ text: studentName
+          ? `(This is an OUTBOUND call the school placed to ${studentName}, a student who has stopped attending lessons. Do NOT say "How may I help you?". Greet ${studentName} by name now, mention you noticed they haven't been coming to lessons, and warmly ask them to come back, offering help if there's any problem.)`
+          : '(This is an OUTBOUND call the school placed to one of its students. Do NOT say "How may I help you?". Greet them now, mention you noticed they haven\'t been coming to lessons, and warmly ask them to come back, offering help if there\'s any problem.)' }] }],
+        turnComplete: true,
+      },
+    }));
+    console.log(`[${elapsed()}] Greeting prompt sent to Gemini${studentName ? ` (student: ${studentName})` : ' (no student name)'}`);
+  };
 
   const geminiWs = new WebSocket(
     `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${process.env.GOOGLE_API_KEY}`
@@ -197,18 +219,7 @@ wss.on('connection', (twilioWs, req) => {
       while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
         geminiWs.send(pendingAudio.shift());
       }
-      // Prompt an immediate greeting so the caller doesn't hear dead air
-      // while waiting for Gemini's handshake to finish.
-      firstAudioSentAt = Date.now();
-      geminiWs.send(JSON.stringify({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text: studentName
-            ? `(This is an OUTBOUND call the school placed to ${studentName}, a student who has stopped attending lessons. Do NOT say "How may I help you?". Greet ${studentName} by name now, mention you noticed they haven't been coming to lessons, and warmly ask them to come back, offering help if there's any problem.)`
-            : '(The call has just connected. Greet the caller briefly now.)' }] }],
-          turnComplete: true,
-        },
-      }));
-      console.log(`[${elapsed()}] Greeting prompt sent to Gemini`);
+      maybeSendGreeting();
       return;
     }
 
@@ -254,7 +265,10 @@ wss.on('connection', (twilioWs, req) => {
     switch (data.event) {
       case 'start':
         streamSid = data.start.streamSid;
-        console.log('Stream started:', streamSid);
+        studentName = data.start.customParameters?.studentName || null;
+        streamStarted = true;
+        console.log(`Stream started: ${streamSid}${studentName ? ` (student: ${studentName})` : ' (no student name in customParameters)'}`);
+        maybeSendGreeting();
         break;
 
       case 'media': {
